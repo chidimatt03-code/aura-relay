@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """AURA Zero-Knowledge Encrypted Relay Server (Python 3 stdlib + SQLite)."""
-import base64, hashlib, json, os, sqlite3, time
+import base64, hashlib, json, os, re, sqlite3, time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 PORT = int(os.environ.get("PORT", "8787"))
@@ -10,6 +10,7 @@ def db():
     conn = sqlite3.connect(DB_PATH)
     conn.execute("CREATE TABLE IF NOT EXISTS msgs (id TEXT PRIMARY KEY, recipient TEXT, env TEXT, ts INTEGER)")
     conn.execute("CREATE INDEX IF NOT EXISTS idx_rec ON msgs(recipient)")
+    conn.execute("CREATE TABLE IF NOT EXISTS users (handle TEXT PRIMARY KEY, fp TEXT, card TEXT, ts INTEGER)")
     return conn
 
 class Handler(BaseHTTPRequestHandler):
@@ -42,11 +43,23 @@ class Handler(BaseHTTPRequestHandler):
             with db() as conn:
                 rows = conn.execute("SELECT id, env FROM msgs WHERE recipient = ? ORDER BY ts ASC LIMIT 200", (fp,)).fetchall()
             return self.send_json(200, {"messages": [{"id": r[0], "env": r[1]} for r in rows]})
+        if self.path.startswith("/v1/lookup/"):
+            h = self.path.split("/v1/lookup/", 1)[1].strip().lower()
+            with db() as conn:
+                row = conn.execute("SELECT card FROM users WHERE handle = ?", (h,)).fetchone()
+            if not row:
+                return self.send_json(404, {"error": "not_found"})
+            return self.send_json(200, {"handle": h, "card": row[0]})
         self.send_json(404, {"error": "not_found"})
 
     def do_POST(self):
         length = int(self.headers.get("Content-Length", "0"))
-        body = json.loads(self.rfile.read(length).decode("utf-8") or "{}")
+        if length > 200000:
+            return self.send_json(413, {"error": "too_large"})
+        try:
+            body = json.loads(self.rfile.read(length).decode("utf-8") or "{}")
+        except Exception:
+            return self.send_json(400, {"error": "bad_json"})
         if self.path == "/v1/send":
             to_fp = body.get("to", "").strip()
             msg_id = body.get("id", "").strip()
@@ -56,6 +69,25 @@ class Handler(BaseHTTPRequestHandler):
             with db() as conn:
                 conn.execute("INSERT OR IGNORE INTO msgs(id, recipient, env, ts) VALUES(?,?,?,?)",
                              (msg_id, to_fp, env, int(time.time())))
+                conn.execute("DELETE FROM msgs WHERE ts < ?", (int(time.time()) - 7 * 86400,))
+            return self.send_json(200, {"ok": True})
+        if self.path == "/v1/register":
+            h = str(body.get("handle", "")).strip().lower()
+            fp = str(body.get("fp", "")).strip().lower()
+            card = str(body.get("card", "")).strip()
+            if not re.fullmatch(r"[a-z0-9]{1,12}-[0-9]{4}", h) or not re.fullmatch(r"[0-9a-f]{64}", fp):
+                return self.send_json(400, {"error": "bad_handle"})
+            if h[-4:] != "%04d" % (int(fp[:4], 16) % 10000):
+                return self.send_json(400, {"error": "handle_mismatch"})
+            if not card.startswith("NEXA1:") or len(card) > 4000:
+                return self.send_json(400, {"error": "bad_card"})
+            with db() as conn:
+                row = conn.execute("SELECT fp, card FROM users WHERE handle = ?", (h,)).fetchone()
+                if row:
+                    if row[0] == fp and row[1] == card:
+                        return self.send_json(200, {"ok": True})
+                    return self.send_json(409, {"error": "handle_taken"})
+                conn.execute("INSERT INTO users(handle, fp, card, ts) VALUES(?,?,?,?)", (h, fp, card, int(time.time())))
             return self.send_json(200, {"ok": True})
         if self.path == "/v1/ack":
             to_fp = body.get("to", "").strip()
